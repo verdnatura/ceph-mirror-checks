@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+Nagios plugin to check Ceph RBD snapshot-based mirroring health.
+
+The script connects to a Ceph cluster and inspects all pools with
+RBD mirroring enabled in IMAGE mode. For each mirrored image, it
+evaluates the mirror state (replaying or stopped) and, when stopped,
+parses peer status metadata to detect stale or desynchronized snapshots
+based on a configurable age cut-off. The plugin reports OK when all
+images are synchronized, or CRITICAL when unsynchronized, stale, or
+misconfigured images are detected.
+
+An optional YAML configuration file can be used to exclude images:
+- poolExclude: list of pool names to skip.
+- excludeRegex: list of regular expressions matched against "pool/image".
+
+When invoked with the -m option, the plugin prints the rbd commands
+required to enable snapshot-based mirroring for images where mirroring
+is currently disabled.
+
+Required Ceph permissions for the client used (e.g., [client.nagios]):
+- mon = "allow r"
+- osd = "allow r, allow "class-read"
+
+Use the -h option to display all available command-line parameters.
+"""
+
+__author__ = 'Juan Ferrer Toribio <juan@verdnatura.es>'
+__copyright__ = 'Copyright (c) 2025 Verdnatura Levante SL'
+__license__ = 'GPLv3'
+__version__ = '1.0.0'
+
+import rados
+import rbd
+import json
+import time
+import sys
+import argparse
+import re
+import yaml
+import os
+from enum import IntEnum
+
+class PoolModes(IntEnum):
+    NONE = 0
+    IMAGE = 1
+
+class ImageState(IntEnum):
+    UP_REPLAYING = 4
+    UP_STOPPED = 6
+
+# Parse arguments
+
+parser = argparse.ArgumentParser(
+    description="Ceph RBD mirror health Nagios plugin."
+)
+parser.add_argument('-c', '--conf',
+    help="Alternative ceph conf file",
+    default='/etc/ceph/ceph.conf',
+)
+parser.add_argument('-k', '--keyring',
+    help="Ceph client keyring file",
+)
+parser.add_argument('-n', '--name',
+    help="Ceph client name",
+)
+parser.add_argument('-i', '--id',
+    help="Ceph client name",
+    default='admin',
+)
+parser.add_argument('-t', '--cutoff',
+    help="Snapshot age cut-off seconds",
+    default=129600, # 36 hours
+    type=int,
+)
+parser.add_argument('-m', '--commands',
+    help="Display commands to enable mirroring",
+    action='store_true',
+)
+parser.add_argument('-f', '--cconf',
+    help="Check configuration file",
+    default='/etc/nagios/check_rbd_mirror.yaml',
+)
+args = parser.parse_args()
+
+# Check configuration
+
+conf = {
+    'poolExclude': [],
+    'excludeRegex': [],
+}
+if os.path.isfile(args.cconf):
+    with open(args.cconf) as f:
+        fileConf = yaml.safe_load(f) or {}
+        conf = {**conf, **fileConf}
+
+pool_exclude = set(conf['poolExclude'] or [])
+
+if conf['excludeRegex']:
+    exclude_regex = []
+    for regex in conf['excludeRegex']:
+        exclude_regex.append(re.compile(regex))
+else:
+    exclude_regex = None
+
+snap_cutoff = int(time.time()) - args.cutoff
+
+# Connect to Ceph cluster
+
+try:
+    keyring = args.keyring
+    if not keyring:
+        keyring = f'/etc/ceph/ceph.client.{args.id}.keyring'
+    name = args.name
+    if not name:
+        name = f'client.{args.id}'
+    cluster = rados.Rados(
+        conffile=args.conf,
+        name=name,
+        conf=dict(
+            keyring=keyring,
+        )
+    )
+    cluster.connect()
+except Exception as e:
+    print(f"CRITICAL - Cannot connect to Ceph cluster: {e}")
+    sys.exit(2)
+
+# Iterate over snapshot mirrored pools
+
+n_excluded = 0
+n_up = 0
+n_stopped = 0
+n_replaying = 0
+n_total = 0
+img_errors = {}
+
+for pool in cluster.list_pools():
+    if pool in pool_exclude:
+        continue
+
+    try:
+        ioctx = cluster.open_ioctx(pool)
+        rbd_inst = rbd.RBD()
+        images = rbd_inst.list(ioctx)
+    except Exception as e:
+        print(f"CRITICAL - Error opening pool {pool}: {e}")
+        sys.exit(2)
+
+    mirror_mode = rbd_inst.mirror_mode_get(ioctx)
+    if mirror_mode != PoolModes.IMAGE:
+        ioctx.close()
+        continue
+
+    statuses = rbd_inst.mirror_image_status_list(ioctx)
+    img_statuses = {status['name']: status for status in statuses}
+
+    # Iterate over images
+
+    for img_name in images:
+        img_full_name = f'{pool}/{img_name}'
+        if exclude_regex:
+            excluded = False
+            for regex in exclude_regex:
+                if regex.match(img_full_name):
+                    excluded = True
+                    break
+            if excluded:
+                n_excluded +=1
+                continue
+
+        n_total += 1
+        img_error = ''
+
+        img_status = img_statuses.get(img_name)
+        if img_status:
+            state = img_status['state']
+            if state == ImageState.UP_STOPPED:
+                n_stopped += 1
+                peers = img_status.get('remote_statuses', [])
+                if peers and len(peers) > 0:
+                    description = peers[0]['description']
+                    desc_json_str = description.split(',', 1)[-1].strip()
+                    try:
+                        desc_json = json.loads(desc_json_str)
+                        local_stamp = desc_json.get('local_snapshot_timestamp', 0)
+                        remote_stamp = desc_json.get('remote_snapshot_timestamp', 0)
+                        if remote_stamp < snap_cutoff:
+                            img_error = 'snap+desync'
+                        elif local_stamp < snap_cutoff:
+                            img_error = 'snap+old'
+                    except json.JSONDecodeError:
+                        img_error = 'json+invalid'
+                else:
+                    img_error = 'peer+empty'
+            elif state == ImageState.UP_REPLAYING:
+                n_replaying += 1
+            else:
+                img_error = 'state+unknown'
+        else:
+            img_error = 'mirror+disabled'
+
+        if not img_error:
+            n_up += 1
+        else:
+            img_errors[img_full_name] = img_error
+
+    ioctx.close()
+
+cluster.shutdown()
+
+# Output results
+
+if args.commands:
+    for img in sorted(img_errors):
+        if img_errors[img] == 'mirror+disabled':
+            print(f'rbd mirror image enable "{img}" snapshot')
+    sys.exit(0)
+
+n_errors = len(img_errors)
+perf_data = f'n_up={n_up} n_replaying={n_replaying} n_stopped={n_stopped} n_excluded={n_excluded}'
+
+if n_errors == 0:
+    print(f"OK - All {n_up} images up | {perf_data}")
+    sys.exit(0)
+else:
+    perf_data = f'n_errors={n_errors} n_total={n_total} {perf_data}'
+    print(f"CRITICAL - {n_errors} of {n_total} images unsynchronized | {perf_data}")
+    for img in sorted(img_errors):
+        print(f"{img} => {img_errors[img]}")
+    sys.exit(2)
