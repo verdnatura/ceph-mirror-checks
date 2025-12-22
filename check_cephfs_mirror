@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+Nagios plugin to check CephFS snapshot-based mirroring health.
+
+The script connects to a Ceph cluster using the native Python RADOS API
+and inspects all filesystems with mirroring enabled. For each filesystem,
+it evaluates the status of its peers, counting failures, recoveries, and
+mirrored directories. The plugin reports OK when all filesystems are
+healthy or mirroring is not enabled, and CRITICAL when errors are detected.
+
+Performance data includes:
+- Number of filesystems
+- Number of peers
+- Total directories
+- Number of failures and recoveries
+- Number of filesystems with errors
+
+Required Ceph permissions for the client used (e.g., [client.nagios]):
+- mon = "allow r"
+- mds = "allow r"
+
+Use the -h option to display all available command-line parameters.
+"""
+
+__author__ = 'Juan Ferrer Toribio <juan@verdnatura.es>'
+__copyright__ = 'Copyright (c) 2025 Verdnatura Levante SL'
+__license__ = 'GPLv3'
+__version__ = '1.0.0'
+
+import rados
+import json
+import sys
+import argparse
+from enum import IntEnum
+
+class Status(IntEnum):
+    OK = 0
+    WARNING = 1
+    CRITICAL = 2
+    UNKNOWN = 3
+
+# Parse arguments
+
+parser = argparse.ArgumentParser(
+    description="Ceph RBD mirror health Nagios plugin."
+)
+parser.add_argument('-c', '--conf',
+    help="Alternative ceph conf file",
+    default='/etc/ceph/ceph.conf',
+)
+parser.add_argument('-k', '--keyring',
+    help="Ceph client keyring file",
+)
+parser.add_argument('-n', '--name',
+    help="Ceph client name",
+)
+parser.add_argument('-i', '--id',
+    help="Ceph client name",
+    default='admin',
+)
+args = parser.parse_args()
+
+# Connect to Ceph cluster
+
+try:
+    keyring = args.keyring
+    if not keyring:
+        keyring = f'/etc/ceph/ceph.client.{args.id}.keyring'
+    name = args.name
+    if not name:
+        name = f'client.{args.id}'
+    cluster = rados.Rados(
+        conffile=args.conf,
+        name=name,
+        conf=dict(
+            keyring=keyring,
+        )
+    )
+    cluster.connect()
+except Exception as e:
+    print(f"CRITICAL - Cannot connect to Ceph cluster: {e}")
+    sys.exit(Status.CRITICAL)
+
+try:
+    cmd = {
+        'prefix': 'fs snapshot mirror daemon status',
+        'format': 'json',
+    }
+    ret, buf, err = cluster.mon_command(json.dumps(cmd), b'', timeout=10)
+    if ret != 0:
+        raise Exception(f"Ceph command failed: {err}")
+
+    try:
+        data = json.loads(buf.decode())
+    except json.JSONDecodeError:
+        print(f"UNKNOWN - Cannot decode command JSON output")
+        sys.exit(Status.UNKNOWN)
+finally:
+    cluster.shutdown()
+
+if not len(data):
+    print(f"OK - CephFS mirroring not enabled")
+    sys.exit(Status.OK)
+
+n_failure = 0
+n_recovery = 0
+n_directories = 0
+fs_set = set()
+peers_set = set()
+fs_errors = {}
+
+try:
+    for daemon in data:
+        for fs in daemon['filesystems']:
+            fs_name = fs['name']
+
+            try:
+                n_directories += fs['directory_count']
+                fs_set.add(fs_name)
+
+                if 'peers' not in fs or len(fs['peers']) == 0:
+                    fs_errors[fs_name] = 'peer+empty'
+                    continue
+
+                for peer in fs['peers']:
+                    stats = peer['stats']
+                    peers_set.add(peer['uuid'])
+
+                    failure_count = stats['failure_count']
+                    n_failure += failure_count
+                    recovery_count = stats['recovery_count']
+                    n_recovery += recovery_count
+
+                    if failure_count > recovery_count + 1:
+                        fs_errors[fs_name] = 'failure'
+            except KeyError:
+                fs_errors[fs_name] = 'json+key'
+
+except KeyError as e:
+    print(f"CRITICAL - Bad command JSON structure: {str(e)}")
+    sys.exit(Status.CRITICAL)
+
+n_fs = len(fs_set)
+n_peers = len(peers_set)
+n_errors = len(fs_errors)
+perf_data = f'n_fs={n_fs} n_peers={n_peers} n_directories={n_directories} n_failure={n_failure} n_recovery={n_recovery}'
+
+if n_errors == 0:
+    print(f"OK - All {n_directories} directories of {n_fs} filesystems mirrored | {perf_data}")
+    sys.exit(Status.OK)
+else:
+    perf_data = f'n_errors={n_errors} {perf_data}'
+    print(f"CRITICAL - Errors in {n_errors} of {n_fs} filesystems | {perf_data}")
+    for fs in sorted(fs_errors):
+        print(f"{fs} => {fs_errors[fs]}")
+    sys.exit(Status.CRITICAL)
