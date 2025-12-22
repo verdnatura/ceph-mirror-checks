@@ -145,12 +145,18 @@ n_peers = len(peers_set)
 n_errors = len(fs_errors)
 perf_data = f'n_fs={n_fs} n_peers={n_peers} n_directories={n_directories} n_failure={n_failure} n_recovery={n_recovery}'
 
-if n_errors == 0:
-    print(f"OK - All {n_directories} directories of {n_fs} filesystems mirrored | {perf_data}")
-    sys.exit(Status.OK)
-else:
+if n_errors:
     perf_data = f'n_errors={n_errors} {perf_data}'
-    print(f"CRITICAL - Errors in {n_errors} of {n_fs} filesystems | {perf_data}")
+    status_text = f"Errors in {n_errors} of {n_fs} filesystems"
+    exit_status = Status.CRITICAL
+else:
+    status_text = f"All {n_directories} directories of {n_fs} filesystems mirrored"
+    exit_status = Status.OK
+
+print(f"{Status(exit_status).name} - {status_text} | {perf_data}")
+
+if n_errors:
     for fs in sorted(fs_errors):
         print(f"{fs} => {fs_errors[fs]}")
-    sys.exit(Status.CRITICAL)
+
+sys.exit(exit_status)
