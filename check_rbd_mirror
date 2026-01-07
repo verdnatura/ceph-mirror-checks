@@ -81,7 +81,7 @@ parser.add_argument('-n', '--name',
     help="Ceph client name",
 )
 parser.add_argument('-i', '--id',
-    help="Ceph client name",
+    help="Ceph client name (default: %(default)s)",
     default='admin',
 )
 parser.add_argument('-t', '--cutoff',
